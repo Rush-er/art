@@ -28,7 +28,6 @@
 #include "code_generator.h"
 #include "handle.h"
 #include "mirror/class.h"
-#include "nodes.h"
 #include "obj_ptr-inl.h"
 #include "scoped_thread_state_change-inl.h"
 #include "subtype_check.h"
@@ -523,26 +522,6 @@ void GraphChecker::VisitMonitorOperation(HMonitorOperation* monitor_op) {
   flag_info_.seen_monitor_operation = true;
 }
 
-bool GraphChecker::ContainedInItsBlockList(HInstruction* instruction) {
-  HBasicBlock* block = instruction->GetBlock();
-  ScopedArenaSafeMap<HBasicBlock*, ScopedArenaHashSet<HInstruction*>>& instruction_set =
-      instruction->IsPhi() ? phis_per_block_ : instructions_per_block_;
-  auto map_it = instruction_set.find(block);
-  if (map_it == instruction_set.end()) {
-    // Populate extra bookkeeping.
-    map_it = instruction_set.insert(
-        {block, ScopedArenaHashSet<HInstruction*>(allocator_.Adapter(kArenaAllocGraphChecker))})
-        .first;
-    const HInstructionList& instruction_list = instruction->IsPhi() ?
-                                                   instruction->GetBlock()->GetPhis() :
-                                                   instruction->GetBlock()->GetInstructions();
-    for (HInstructionIterator list_it(instruction_list); !list_it.Done(); list_it.Advance()) {
-        map_it->second.insert(list_it.Current());
-    }
-  }
-  return map_it->second.find(instruction) != map_it->second.end();
-}
-
 void GraphChecker::VisitInstruction(HInstruction* instruction) {
   if (seen_ids_.IsBitSet(instruction->GetId())) {
     AddError(StringPrintf("Instruction id %d is duplicate in graph.",
@@ -565,19 +544,23 @@ void GraphChecker::VisitInstruction(HInstruction* instruction) {
                           instruction->GetBlock()->GetBlockId()));
   }
 
-  // Ensure the inputs of `instruction` are defined in a block of the graph, and the entry in the
-  // use list is consistent.
+  // Ensure the inputs of `instruction` are defined in a block of the graph.
   for (HInstruction* input : instruction->GetInputs()) {
     if (input->GetBlock() == nullptr) {
       AddError(StringPrintf("Input %d of instruction %d is not in any "
                             "basic block of the control-flow graph.",
                             input->GetId(),
                             instruction->GetId()));
-    } else if (!ContainedInItsBlockList(input)) {
+    } else {
+      const HInstructionList& list = input->IsPhi()
+          ? input->GetBlock()->GetPhis()
+          : input->GetBlock()->GetInstructions();
+      if (!list.Contains(input)) {
         AddError(StringPrintf("Input %d of instruction %d is not defined "
                               "in a basic block of the control-flow graph.",
                               input->GetId(),
                               instruction->GetId()));
+      }
     }
   }
 
@@ -585,7 +568,10 @@ void GraphChecker::VisitInstruction(HInstruction* instruction) {
   // and the entry in the use list is consistent.
   for (const HUseListNode<HInstruction*>& use : instruction->GetUses()) {
     HInstruction* user = use.GetUser();
-    if (!ContainedInItsBlockList(user)) {
+    const HInstructionList& list = user->IsPhi()
+        ? user->GetBlock()->GetPhis()
+        : user->GetBlock()->GetInstructions();
+    if (!list.Contains(user)) {
       AddError(StringPrintf("User %s:%d of instruction %d is not defined "
                             "in a basic block of the control-flow graph.",
                             user->DebugName(),
@@ -735,20 +721,10 @@ void GraphChecker::VisitInvoke(HInvoke* invoke) {
     }
     flag_info_.seen_always_throwing_invokes = true;
   }
-
-  if (invoke->IsUnreachableIntrinsic()) {
-    AddError(
-        StringPrintf("The graph contains an instrinsic which should have been replaced in the "
-                     "instruction builder: %s:%d in block %d.",
-                     invoke->DebugName(),
-                     invoke->GetId(),
-                     invoke->GetBlock()->GetBlockId()));
-  }
 }
 
 void GraphChecker::VisitInvokeStaticOrDirect(HInvokeStaticOrDirect* invoke) {
-  // We call VisitInvoke and not VisitInstruction to de-duplicate the common code: always throwing
-  // and instrinsic checks.
+  // We call VisitInvoke and not VisitInstruction to de-duplicate the always throwing code check.
   VisitInvoke(invoke);
 
   if (invoke->IsStaticWithExplicitClinitCheck()) {
